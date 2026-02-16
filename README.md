@@ -1,5 +1,7 @@
 # Claude Code Dispatch 🚀
 
+**[中文文档 / Chinese README](README_CN.md)**
+
 **One-command dispatch of development tasks to Claude Code with automatic notification on completion.** Zero polling, zero token waste.
 
 Fire-and-forget your coding tasks → Claude Code builds it in the background → you get a rich Telegram notification when it's done.
