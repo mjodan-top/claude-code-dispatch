@@ -121,6 +121,17 @@ TRUSTEOF
     echo "🔓 Workspace trust configured for: $WORKDIR"
 fi
 
+# ---- Auto-authorize workdir in ~/.claude.json ----
+# Update hasTrustDialogAccepted to true to skip interactive authorization
+CLAUDE_CONFIG="$HOME/.claude.json"
+if [ -f "$CLAUDE_CONFIG" ]; then
+    # Normalize workdir (resolve symlinks, etc.)
+    REAL_WORKDIR=$(cd "$WORKDIR" 2>/dev/null && pwd -P || echo "$WORKDIR")
+    # Use jq to update the project trust setting
+    jq --arg dir "$REAL_WORKDIR" '.projects[$dir].hasTrustDialogAccepted = true' "$CLAUDE_CONFIG" > "${CLAUDE_CONFIG}.tmp" 2>/dev/null && mv "${CLAUDE_CONFIG}.tmp" "$CLAUDE_CONFIG"
+    echo "🔓 Workspace authorized: $REAL_WORKDIR"
+fi
+
 # ---- Auto-detect callback from workspace config ----
 if [ -z "$CALLBACK_GROUP" ] && [ -z "$CALLBACK_DM" ]; then
     for SEARCH_DIR in "$(pwd)" "$WORKDIR" "${OPENCLAW_AGENT_DIR:-}"; do
