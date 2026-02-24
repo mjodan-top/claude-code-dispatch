@@ -180,6 +180,21 @@ echo "   Agent Teams: ${AGENT_TEAMS:-no}"
 > "$TASK_OUTPUT"
 
 # ---- 3. Build runner command ----
+# Add deep analysis system prompt for code investigation tasks
+# This guides Claude Code to use tools iteratively for thorough analysis
+PROMPT="${PROMPT}
+
+## 代码分析工作流（重要）
+请按照以下步骤进行深度分析，每步使用工具验证：
+
+1. **定位文件**: 使用 Bash 工具执行 find/grep 命令定位相关文件
+2. **读取代码**: 使用 Read 工具读取源代码内容
+3. **追踪调用链**: 搜索函数调用、类引用、include/require 语句
+4. **验证假设**: 不要猜测，用工具调用来确认
+5. **输出证据**: 给出具体文件路径和代码行号
+
+不要只给表面摘要，要深入分析具体代码。"
+
 if [ -n "$AGENT_TEAMS" ]; then
     PROMPT="${PROMPT}
 
