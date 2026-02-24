@@ -25,7 +25,26 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_CLAUDE = os.environ.get("CLAUDE_CODE_BIN", "claude")
+DEFAULT_CLAUDE = os.environ.get("CLAUDE_CODE_BIN") or os.environ.get("CLAUDE_BIN")
+
+# Try to find claude binary using type -P (bypass shell functions)
+if not DEFAULT_CLAUDE:
+    try:
+        result = subprocess.run(["type", "-P", "claude"], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            DEFAULT_CLAUDE = result.stdout.strip()
+    except Exception:
+        pass
+
+# Fallback to common locations
+if not DEFAULT_CLAUDE:
+    for loc in [os.path.expanduser("~/.local/bin/claude"), "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]:
+        if os.path.isfile(loc):
+            DEFAULT_CLAUDE = loc
+            break
+
+if not DEFAULT_CLAUDE:
+    DEFAULT_CLAUDE = "claude"
 
 
 def which(name: str) -> str | None:
@@ -51,6 +70,9 @@ def looks_like_slash_commands(prompt: str | None) -> bool:
 
 def build_headless_cmd(args: argparse.Namespace) -> list[str]:
     cmd: list[str] = [args.claude_bin]
+
+    # Skip permissions prompt for automated/headless usage
+    cmd += ["--dangerously-skip-permissions", "--permission-mode", "dontAsk"]
 
     if args.permission_mode:
         cmd += ["--permission-mode", args.permission_mode]
@@ -98,15 +120,41 @@ def build_agent_teams_env(args: argparse.Namespace) -> dict[str, str]:
 
 
 def run_with_pty(cmd: list[str], cwd: str | None, env: dict[str, str] | None = None) -> int:
-    cmd_str = " ".join(shlex.quote(c) for c in cmd)
+    import platform
+    import pty
+    import select
 
-    script_bin = which("script")
-    if not script_bin:
-        proc = subprocess.run(cmd, cwd=cwd, text=True, env=env)
-        return proc.returncode
+    # Use pty.spawn for macOS compatibility
+    def spawn_in_pty():
+        pid, master_fd = pty.fork()
+        if pid == pty.CHILD:
+            # Child process - exec the command
+            os.chdir(cwd or os.getcwd())
+            os.execvpe(cmd[0], cmd, env or os.environ)
+        else:
+            # Parent process - read and forward output
+            while True:
+                try:
+                    rlist, _, _ = select.select([master_fd], [], [], 0.5)
+                    if rlist:
+                        data = os.read(master_fd, 10240)
+                        if not data:
+                            break
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
 
-    proc = subprocess.run([script_bin, "-q", "-c", cmd_str, "/dev/null"], cwd=cwd, text=True, env=env)
-    return proc.returncode
+                    # Check if child process is still running
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                    if wpid:
+                        break
+                except (OSError, KeyboardInterrupt):
+                    break
+
+            # Wait for child to complete
+            _, status = os.waitpid(pid, 0)
+            return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+
+    return spawn_in_pty()
 
 
 def tmux_cmd(socket_path: str, *args: str) -> list[str]:
@@ -278,10 +326,30 @@ def main() -> int:
         extra = extra[1:]
     args.extra = extra
 
-    if not Path(args.claude_bin).exists():
+    # Check if claude binary exists - handle both file path and command name
+    claude_path = args.claude_bin
+    if not Path(claude_path).exists():
+        # Try to find the actual binary using type -P (bypasses shell functions)
+        try:
+            result = subprocess.run(["type", "-P", claude_path], capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                claude_path = result.stdout.strip()
+            else:
+                # Fallback: search in PATH
+                found = which(claude_path)
+                if found:
+                    claude_path = found
+        except Exception:
+            pass
+
+    # Final check - if still not found, error
+    if not Path(claude_path).exists():
         print(f"claude binary not found: {args.claude_bin}", file=sys.stderr)
-        print("Tip: set CLAUDE_CODE_BIN=/path/to/claude", file=sys.stderr)
+        print("Tip: set CLAUDE_CODE_BIN=/path/to/claude or CLAUDE_BIN=claude", file=sys.stderr)
         return 2
+
+    # Update args.claude_bin with the resolved path
+    args.claude_bin = claude_path
 
     mode = args.mode
     if mode == "auto" and looks_like_slash_commands(args.prompt):
