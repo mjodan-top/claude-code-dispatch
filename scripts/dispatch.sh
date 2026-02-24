@@ -15,6 +15,7 @@
 #   --permission-mode MODE   Claude Code permission mode
 #   --allowed-tools TOOLS    Allowed tools string
 #   --model MODEL            Model override
+#   --ali                    Use Aliyun environment (same as cfa alias)
 #   --callback-group ID      Telegram group for callback (dispatching agent's group)
 #   --callback-dm ID         Telegram user ID for DM callback
 #   --callback-account NAME  Telegram bot account name for DM callback
@@ -30,17 +31,29 @@ set -euo pipefail
 
 # ---- Configuration (override via env vars) ----
 RESULT_DIR="${RESULT_DIR:-$(pwd)/data/claude-code-results}"
-META_FILE="${RESULT_DIR}/task-meta.json"
-TASK_OUTPUT="${RESULT_DIR}/task-output.txt"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RUNNER="${SCRIPT_DIR}/claude_code_run.py"
 
 # Auto-detect openclaw binary
 OPENCLAW_BIN="${OPENCLAW_BIN:-$(command -v openclaw 2>/dev/null || echo "")}"
 
+# Auto-detect claude binary
+CLAUDE_BIN="${CLAUDE_CODE_BIN:-}"
+if [ -z "$CLAUDE_BIN" ]; then
+    # Try to find claude binary (skip shell function)
+    for loc in "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude" "/usr/local/bin/claude"; do
+        if [ -f "$loc" ]; then
+            CLAUDE_BIN="$loc"
+            break
+        fi
+    done
+fi
+if [ -z "$CLAUDE_BIN" ]; then
+    CLAUDE_BIN="claude"
+fi
+
 # Defaults
 PROMPT=""
 TASK_NAME="adhoc-$(date +%s)"
+TASK_ID=""
 TELEGRAM_GROUP=""
 CALLBACK_GROUP=""
 CALLBACK_DM=""
@@ -52,6 +65,7 @@ TEAMMATE_MODE=""
 PERMISSION_MODE=""
 ALLOWED_TOOLS=""
 MODEL=""
+ALI_ENV=""
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -69,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         --permission-mode) PERMISSION_MODE="$2"; shift 2;;
         --allowed-tools) ALLOWED_TOOLS="$2"; shift 2;;
         --model) MODEL="$2"; shift 2;;
+        --ali) ALI_ENV="1"; shift;;
         *) echo "Unknown option: $1" >&2; exit 1;;
     esac
 done
@@ -77,6 +92,19 @@ if [ -z "$PROMPT" ]; then
     echo "Error: --prompt is required" >&2
     exit 1
 fi
+
+# Generate unique task ID
+TASK_ID="${TASK_NAME}-$(date +%s)"
+
+# ---- Task-specific result directory (multi-session support) ----
+# Each task gets its own directory to avoid conflicts
+TASK_RESULT_DIR="${RESULT_DIR}/${TASK_ID}"
+META_FILE="${TASK_RESULT_DIR}/task-meta.json"
+TASK_OUTPUT="${TASK_RESULT_DIR}/task-output.txt"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUNNER="${SCRIPT_DIR}/claude_code_run.py"
+
+mkdir -p "$TASK_RESULT_DIR"
 
 # ---- Auto-detect callback from workspace config ----
 if [ -z "$CALLBACK_GROUP" ] && [ -z "$CALLBACK_DM" ]; then
@@ -141,6 +169,17 @@ if [ -n "$AGENT_TEAMS" ]; then
 5. Final output: feature list + test result summary"
 fi
 
+# Add Aliyun system prompt if --ali is set (same as cfa alias)
+if [ -n "$ALI_ENV" ]; then
+    PROMPT="${PROMPT}
+
+## Environment: Aliyun Qwen3.5 Plus
+- You are running on Aliyun cloud infrastructure using Qwen3.5 Plus model
+- The ANTHROPIC_BASE_URL is set to dashscope.aliyuncs.com
+- Leverage Aliyun services when appropriate (OSS, RDS, FC, etc.)
+- Follow Aliyun best practices for security and performance"
+fi
+
 CMD=(python3 "$RUNNER" -p "$PROMPT" --cwd "$WORKDIR")
 
 [ -n "$AGENT_TEAMS" ] && CMD+=(--agent-teams)
@@ -152,6 +191,24 @@ CMD=(python3 "$RUNNER" -p "$PROMPT" --cwd "$WORKDIR")
 if [ -n "$MODEL" ]; then
     export ANTHROPIC_MODEL="$MODEL"
 fi
+
+# Export CLAUDE_BIN for claude_code_run.py
+if [ -n "$CLAUDE_BIN" ] && [ -f "$CLAUDE_BIN" ]; then
+    export CLAUDE_CODE_BIN="$CLAUDE_BIN"
+fi
+
+# Set Aliyun environment if --ali is set (same as cfa alias)
+if [ -n "$ALI_ENV" ]; then
+    export ANTHROPIC_BASE_URL="https://coding.dashscope.aliyuncs.com/apps/anthropic"
+    export ANTHROPIC_MODEL="qwen3.5-plus"
+    export ANTHROPIC_SMALL_FAST_MODEL="qwen3.5-plus"
+    export ANTHROPIC_API_KEY="sk-sp-dbc3eedc26184fb1b6bae82509addbd0"
+    echo "☁️  Aliyun environment configured (Qwen3.5 Plus)"
+fi
+
+# Unset CLAUDECODE to allow running from within Claude Code
+# This is required for dispatching tasks from within a Claude Code session
+export CLAUDECODE=""
 
 # ---- 5. Run Claude Code ----
 echo "🚀 Launching Claude Code..."

@@ -20,8 +20,6 @@
 set -uo pipefail
 
 RESULT_DIR="${RESULT_DIR:-$(pwd)/data/claude-code-results}"
-META_FILE="${RESULT_DIR}/task-meta.json"
-TASK_OUTPUT="${RESULT_DIR}/task-output.txt"
 LOG="${RESULT_DIR}/hook.log"
 OPENCLAW_BIN="${OPENCLAW_BIN:-$(command -v openclaw 2>/dev/null || echo "")}"
 OPENCLAW_CONFIG="${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}"
@@ -46,12 +44,55 @@ EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // "unknown"' 2>/dev/null || ech
 
 log "session=$SESSION_ID cwd=$CWD event=$EVENT"
 
+# ---- Find task directory (support multi-session) ----
+# Search for the most recent task-meta.json in subdirectories
+TASK_DIR=""
+META_FILE=""
+TASK_OUTPUT=""
+
+# First try: use CWD if it contains task-meta.json
+if [ -n "$CWD" ] && [ -f "${CWD}/data/claude-code-results/task-meta.json" ]; then
+    TASK_DIR="${CWD}/data/claude-code-results"
+elif [ -d "$CWD" ]; then
+    # Search for task-meta.json in CWD's subdirectories
+    FOUND_DIR=$(find "$CWD" -maxdepth 3 -name "task-meta.json" -type f 2>/dev/null | head -1 | xargs -I {} dirname {})
+    if [ -n "$FOUND_DIR" ]; then
+        TASK_DIR="$FOUND_DIR"
+    fi
+fi
+
+# Fallback: search in default RESULT_DIR
+if [ -z "$TASK_DIR" ]; then
+    # Find the most recently modified task-meta.json
+    FOUND_DIR=$(find "$RESULT_DIR" -maxdepth 2 -name "task-meta.json" -type f 2>/dev/null | xargs -I {} dirname {} | head -1)
+    if [ -n "$FOUND_DIR" ]; then
+        TASK_DIR="$FOUND_DIR"
+    fi
+fi
+
+if [ -n "$TASK_DIR" ]; then
+    META_FILE="${TASK_DIR}/task-meta.json"
+    TASK_OUTPUT="${TASK_DIR}/task-output.txt"
+    log "Found task directory: $TASK_DIR"
+else
+    log "ERROR: Could not find task directory"
+    META_FILE=""
+    TASK_OUTPUT=""
+fi
+
 # ---- Deduplication: Only process first event (Stop), skip SessionEnd ----
-LOCK_FILE="${RESULT_DIR}/.hook-lock"
+# Use task-specific lock file to support multi-session
+LOCK_FILE=""
+if [ -n "$TASK_DIR" ]; then
+    LOCK_FILE="${TASK_DIR}/.hook-lock"
+else
+    LOCK_FILE="${RESULT_DIR}/.hook-lock-global"
+fi
 LOCK_AGE_LIMIT=30
 
 if [ -f "$LOCK_FILE" ]; then
-    LOCK_TIME=$(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0)
+    # macOS compatible stat: use -f %m instead of -c %Y
+    LOCK_TIME=$(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0)
     NOW=$(date +%s)
     AGE=$(( NOW - LOCK_TIME ))
     if [ "$AGE" -lt "$LOCK_AGE_LIMIT" ]; then
@@ -66,7 +107,8 @@ OUTPUT=""
 sleep 1  # Wait for tee pipe flush
 
 if [ -f "$TASK_OUTPUT" ] && [ -s "$TASK_OUTPUT" ]; then
-    OUTPUT=$(tail -c 4000 "$TASK_OUTPUT")
+    # Read output and strip ANSI escape codes
+    OUTPUT=$(cat "$TASK_OUTPUT" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tail -c 4000)
     log "Output from task-output.txt (${#OUTPUT} chars)"
 fi
 
@@ -84,7 +126,9 @@ CALLBACK_DM=""
 CALLBACK_ACCOUNT=""
 
 if [ -f "$META_FILE" ]; then
-    META_AGE=$(( $(date +%s) - $(stat -c %Y "$META_FILE" 2>/dev/null || echo 0) ))
+    # macOS compatible stat: use -f %m instead of -c %Y
+    META_MTIME=$(stat -f %m "$META_FILE" 2>/dev/null || echo 0)
+    META_AGE=$(( $(date +%s) - META_MTIME ))
     if [ "$META_AGE" -gt 7200 ]; then
         log "Meta file is ${META_AGE}s old (>2h), ignoring stale meta"
     else
@@ -127,8 +171,9 @@ if [ -n "$TELEGRAM_GROUP" ] && [ -n "$OPENCLAW_BIN" ]; then
         STARTED=$(jq -r '.started_at // ""' "$META_FILE" 2>/dev/null || echo "")
         COMPLETED=$(jq -r '.completed_at // ""' "$META_FILE" 2>/dev/null || echo "")
         if [ -n "$STARTED" ] && [ -n "$COMPLETED" ]; then
-            START_TS=$(date -d "$STARTED" +%s 2>/dev/null || echo 0)
-            END_TS=$(date -d "$COMPLETED" +%s 2>/dev/null || echo 0)
+            # macOS compatible: convert ISO date to epoch
+            START_TS=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$STARTED" +%s 2>/dev/null || echo 0)
+            END_TS=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$COMPLETED" +%s 2>/dev/null || echo 0)
             if [ "$START_TS" -gt 0 ] && [ "$END_TS" -gt 0 ]; then
                 ELAPSED=$(( END_TS - START_TS ))
                 MINS=$(( ELAPSED / 60 ))
@@ -152,22 +197,23 @@ if [ -n "$TELEGRAM_GROUP" ] && [ -n "$OPENCLAW_BIN" ]; then
     [ "$AGENT_TEAMS_ENABLED" = "true" ] && MSG="${MSG}
 👥 *Agent Teams:* enabled"
 
-    # Extract test results from output
+    # Add output summary (first 500 chars, stripped of ANSI codes)
     if [ -f "$TASK_OUTPUT" ] && [ -s "$TASK_OUTPUT" ]; then
-        TEST_SUMMARY=$(grep -iE '(tests? (passed|failed)|pytest|✅.*test)' "$TASK_OUTPUT" 2>/dev/null | tail -3 || true)
-        [ -n "$TEST_SUMMARY" ] && MSG="${MSG}
+        CLEAN_OUTPUT=$(cat "$TASK_OUTPUT" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | head -c 500 | tr '\n' ' ')
+        [ -n "$CLEAN_OUTPUT" ] && MSG="${MSG}
 
-🧪 *Tests:* $(echo "$TEST_SUMMARY" | head -3 | tr '\n' '; ')"
+📝 *Output:* ${CLEAN_OUTPUT}"
     fi
 
-    # File listing
+    # File listing - only show new/modified files
     if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
-        FILE_TREE=$(find "$PROJECT_DIR" -maxdepth 3 -type f \
+        FILE_TREE=$(find "$PROJECT_DIR" -maxdepth 2 -type f -mmin -30 \
             ! -path '*/venv/*' ! -path '*/__pycache__/*' ! -path '*/.git/*' ! -path '*.pyc' \
-            2>/dev/null | sort | sed "s|${PROJECT_DIR}/||" | head -15 | while IFS= read -r f; do echo "  📄 $f"; done)
+            ! -path '*/data/claude-code-results/*' \
+            2>/dev/null | sort | sed "s|${PROJECT_DIR}/||" | head -10 | while IFS= read -r f; do echo "  📄 $f"; done)
         [ -n "$FILE_TREE" ] && MSG="${MSG}
 
-📁 *Files:*
+📁 *Recent Files:*
 ${FILE_TREE}"
     fi
 
