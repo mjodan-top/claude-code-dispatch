@@ -229,4 +229,14 @@ if [ -f "$META_FILE" ]; then
         "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
 fi
 
+# ---- 6. Trigger notification hook ----
+# Since Claude Code runs in headless mode, it won't trigger ~/.claude/settings.json hooks
+# We need to manually call the notify-hook.sh script
+HOOK_SCRIPT="$(cd "$(dirname "$0")" && pwd)/notify-hook.sh"
+if [ -f "$HOOK_SCRIPT" ]; then
+    echo "📢 Sending notification..."
+    # Simulate Claude Code Stop hook event
+    echo "{\"session_id\": \"${TASK_ID}\", \"cwd\": \"$(pwd)\", \"hook_event_name\": \"Stop\"}" | bash "$HOOK_SCRIPT"
+fi
+
 exit $EXIT_CODE
