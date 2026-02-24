@@ -106,6 +106,21 @@ RUNNER="${SCRIPT_DIR}/claude_code_run.py"
 
 mkdir -p "$TASK_RESULT_DIR"
 
+# ---- Auto-setup workspace trust for Claude Code ----
+# This allows Claude Code to access the workdir without interactive prompts
+WORKDIR_CLAUDE="${WORKDIR}/.claude"
+if [ ! -d "$WORKDIR_CLAUDE" ]; then
+    mkdir -p "$WORKDIR_CLAUDE"
+    cat > "$WORKDIR_CLAUDE/settings.local.json" << 'TRUSTEOF'
+{
+  "workspaceTrust": {
+    "enabled": false
+  }
+}
+TRUSTEOF
+    echo "🔓 Workspace trust configured for: $WORKDIR"
+fi
+
 # ---- Auto-detect callback from workspace config ----
 if [ -z "$CALLBACK_GROUP" ] && [ -z "$CALLBACK_DM" ]; then
     for SEARCH_DIR in "$(pwd)" "$WORKDIR" "${OPENCLAW_AGENT_DIR:-}"; do
